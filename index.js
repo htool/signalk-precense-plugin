@@ -19,7 +19,11 @@ module.exports = function (app) {
   const state = new Map()
   const discovered = new Map()
 
-  plugin.schema = () => ({
+  plugin.schema = () => {
+    const nets = listLocalNetworks()
+    const enums = nets.map((n) => n.cidr)
+    const enumNames = nets.map(networkLabel)
+    return {
     type: 'object',
     properties: {
       pingIntervalSeconds: {
@@ -44,9 +48,14 @@ module.exports = function (app) {
       },
       networks: {
         type: 'array',
-        title: 'Networks to scan (CIDR)',
-        description: 'Empty = local interface subnets',
-        items: { type: 'string' },
+        title: 'Networks to scan',
+        description: enums.length
+          ? 'Kies welk LAN-netwerk(en) gescand worden. Leeg = alle hieronder.'
+          : 'Geen bruikbare LAN-interfaces gevonden; laat leeg.',
+        items: enums.length
+          ? { type: 'string', enum: enums, enumNames: enumNames }
+          : { type: 'string' },
+        uniqueItems: true,
         default: []
       },
       devices: {
@@ -65,9 +74,14 @@ module.exports = function (app) {
         default: []
       }
     }
-  })
+  }
+  }
 
   plugin.uiSchema = () => ({
+    networks: {
+      'ui:widget': 'checkboxes',
+      'ui:options': { inline: false }
+    },
     devices: { items: { enabled: { 'ui:widget': 'checkbox' } } }
   })
 
@@ -79,9 +93,23 @@ module.exports = function (app) {
       .replace(/^-+|-+$/g, '') || 'device'
   }
 
-  function localCidrs () {
-    const out = []
+
+  function prefixFromNetmask (netmask) {
+    if (!netmask) return 24
+    const parts = netmask.split('.').map(Number)
+    let bits = 0
+    for (const p of parts) {
+      for (let i = 7; i >= 0; i--) {
+        if (p & (1 << i)) bits++
+        else return bits
+      }
+    }
+    return bits
+  }
+
+  function listLocalNetworks () {
     const ifaces = os.networkInterfaces()
+    const byCidr = new Map()
     for (const [name, addrs] of Object.entries(ifaces)) {
       if (!addrs) continue
       if (
@@ -93,17 +121,30 @@ module.exports = function (app) {
         name === 'tun0'
       ) continue
       for (const a of addrs) {
-        if (a.family !== 'IPv4' || a.internal) continue
+        const family = a.family === 'IPv4' || a.family === 4
+        if (!family || a.internal) continue
         const parts = a.address.split('.').map(Number)
         const mask = (a.netmask || '255.255.255.0').split('.').map(Number)
         const net = parts.map((p, i) => p & mask[i]).join('.')
-        let prefix = 24
-        if (a.netmask === '255.255.0.0') prefix = 16
-        else if (a.netmask === '255.255.255.128') prefix = 25
-        out.push(net + '/' + prefix)
+        const prefix = prefixFromNetmask(a.netmask)
+        const cidr = net + '/' + prefix
+        const prev = byCidr.get(cidr) || { cidr, iface: name, addresses: [] }
+        if (!prev.addresses.includes(a.address)) prev.addresses.push(a.address)
+        if (name && !prev.iface) prev.iface = name
+        byCidr.set(cidr, prev)
       }
     }
-    return out
+    return Array.from(byCidr.values()).sort((a, b) => a.cidr.localeCompare(b.cidr))
+  }
+
+  function localCidrs () {
+    return listLocalNetworks().map((n) => n.cidr)
+  }
+
+  function networkLabel (n) {
+    const ips = n.addresses.slice(0, 3).join(', ')
+    const more = n.addresses.length > 3 ? '…' : ''
+    return n.iface + ' · ' + ips + more + ' (' + n.cidr + ')'
   }
 
   async function run (cmd, args, timeoutMs) {
