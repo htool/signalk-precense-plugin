@@ -1,6 +1,7 @@
 const { execFile } = require('child_process')
 const { promisify } = require('util')
 const os = require('os')
+const fs = require('fs')
 
 const execFileAsync = promisify(execFile)
 const PLUGIN_ID = 'signalk-precense-plugin'
@@ -58,20 +59,29 @@ module.exports = function (app) {
         uniqueItems: true,
         default: []
       },
-      devices: {
-        type: 'array',
-        title: 'Tracked devices',
-        description: 'Name becomes path slug under sensors.presence',
-        items: {
-          type: 'object',
-          properties: {
-            enabled: { type: 'boolean', title: 'Track', default: true },
-            name: { type: 'string', title: 'Name (path slug)' },
-            ip: { type: 'string', title: 'IP address' },
-            mac: { type: 'string', title: 'MAC (optional)' }
-          }
-        },
-        default: []
+      devices: (() => {
+        const list = listDiscoverableDevices()
+        const enums = list.map((d) => d.key)
+        const enumNames = list.map((d) => d.label)
+        return {
+          type: 'array',
+          title: 'Tracked devices',
+          description: enums.length
+            ? 'Vink ontdekte LAN-devices aan. Pad: sensors.presence.<naam> (hostname of IP).'
+            : 'Nog geen devices in ARP/neigh. Wacht even of open deze pagina opnieuw na discovery.',
+          items: enums.length
+            ? { type: 'string', enum: enums, enumNames: enumNames }
+            : { type: 'string' },
+          uniqueItems: true,
+          default: []
+        }
+      })(),
+      deviceNames: {
+        type: 'object',
+        title: 'Pad-namen (optioneel)',
+        description: 'Overschrijf de Signal K path-slug per device-key (anders hostname of IP).',
+        additionalProperties: { type: 'string' },
+        default: {}
       }
     }
   }
@@ -82,7 +92,13 @@ module.exports = function (app) {
       'ui:widget': 'checkboxes',
       'ui:options': { inline: false }
     },
-    devices: { items: { enabled: { 'ui:widget': 'checkbox' } } }
+    devices: {
+      'ui:widget': 'checkboxes',
+      'ui:options': { inline: false }
+    },
+    deviceNames: {
+      'ui:widget': 'hidden'
+    }
   })
 
   function slugify (name) {
@@ -91,6 +107,143 @@ module.exports = function (app) {
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, '-')
       .replace(/^-+|-+$/g, '') || 'device'
+  }
+
+
+  function deviceKey (entry) {
+    if (entry.mac) return 'mac:' + String(entry.mac).toLowerCase()
+    return 'ip:' + entry.ip
+  }
+
+  function deviceLabel (entry) {
+    const host = (entry.hostname || '').replace(/\.local$/i, '')
+    const mac = entry.mac ? ' (' + entry.mac + ')' : ''
+    if (host) return host + ' · ' + entry.ip + mac
+    return entry.ip + mac
+  }
+
+  function defaultPathName (entry) {
+    const host = (entry.hostname || '').replace(/\.local$/i, '')
+    if (host) return slugify(host)
+    return slugify(String(entry.ip).replace(/\./g, '-'))
+  }
+
+  /** Saved selection keys may outlive ARP; keep them selectable. */
+  let lastOptions = {}
+
+  function seedDiscoveredFromArpSync () {
+    if (discovered.size) return
+    try {
+      const text = fs.readFileSync('/proc/net/arp', 'utf8')
+      for (const line of text.split('\n').slice(1)) {
+        const p = line.trim().split(/\s+/)
+        if (p.length < 4) continue
+        const ip = p[0]
+        const mac = (p[3] || '').toLowerCase()
+        if (!mac || mac === '00:00:00:00:00:00') continue
+        if (!discovered.has(ip)) {
+          discovered.set(ip, { ip: ip, mac: mac, hostname: '', lastSeen: Date.now() })
+        }
+      }
+    } catch (_) {}
+  }
+
+  function listDiscoverableDevices () {
+    seedDiscoveredFromArpSync()
+    const byKey = new Map()
+    for (const entry of discovered.values()) {
+      if (!entry || !entry.ip) continue
+      const key = deviceKey(entry)
+      const prev = byKey.get(key)
+      if (!prev || (entry.lastSeen || 0) >= (prev.lastSeen || 0)) {
+        byKey.set(key, {
+          key: key,
+          ip: entry.ip,
+          mac: entry.mac || '',
+          hostname: entry.hostname || '',
+          lastSeen: entry.lastSeen || 0,
+          label: deviceLabel(entry)
+        })
+      }
+    }
+    // merge previously selected keys from lastOptions so offline devices stay listed
+    const selected = normalizeSelectedKeys(lastOptions.devices)
+    for (const key of selected) {
+      if (byKey.has(key)) continue
+      const parsed = parseDeviceKey(key)
+      if (!parsed) continue
+      byKey.set(key, {
+        key: key,
+        ip: parsed.ip || '',
+        mac: parsed.mac || '',
+        hostname: '',
+        lastSeen: 0,
+        label: (parsed.mac ? parsed.ip + ' (' + parsed.mac + ') [offline]' : parsed.ip + ' [offline]')
+      })
+    }
+    return Array.from(byKey.values()).sort((a, b) => a.label.localeCompare(b.label))
+  }
+
+  function parseDeviceKey (key) {
+    if (!key || typeof key !== 'string') return null
+    if (key.indexOf('mac:') === 0) return { mac: key.slice(4), ip: '' }
+    if (key.indexOf('ip:') === 0) return { ip: key.slice(3), mac: '' }
+    // legacy bare IP
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(key)) return { ip: key, mac: '' }
+    return null
+  }
+
+  function normalizeSelectedKeys (devices) {
+    if (!devices) return []
+    if (!Array.isArray(devices)) return []
+    if (!devices.length) return []
+    if (typeof devices[0] === 'string') return devices.filter(Boolean)
+    // legacy {enabled,name,ip,mac}
+    return devices
+      .filter(function (d) { return d && d.enabled !== false && d.ip })
+      .map(function (d) {
+        return d.mac ? 'mac:' + String(d.mac).toLowerCase() : 'ip:' + d.ip
+      })
+  }
+
+  function resolveTrackedDevices (options) {
+    const names = options.deviceNames || {}
+    const selected = normalizeSelectedKeys(options.devices)
+    // legacy object rows with name
+    if (Array.isArray(options.devices) && options.devices.length && typeof options.devices[0] === 'object') {
+      return options.devices
+        .filter(function (d) { return d && d.enabled !== false && d.ip })
+        .map(function (d) {
+          return {
+            name: d.name || defaultPathName(d),
+            ip: d.ip,
+            mac: d.mac || ''
+          }
+        })
+    }
+    const out = []
+    for (const key of selected) {
+      let entry = null
+      for (const d of discovered.values()) {
+        if (deviceKey(d) === key) { entry = d; break }
+      }
+      const parsed = parseDeviceKey(key)
+      const ip = (entry && entry.ip) || (parsed && parsed.ip) || ''
+      const mac = (entry && entry.mac) || (parsed && parsed.mac) || ''
+      if (!ip && !mac) continue
+      // if only mac known, try find current ip from discovered
+      let useIp = ip
+      if (!useIp && mac) {
+        for (const d of discovered.values()) {
+          if (String(d.mac).toLowerCase() === mac) { useIp = d.ip; break }
+        }
+      }
+      if (!useIp) continue
+      const base = entry || { ip: useIp, mac: mac, hostname: '' }
+      const name = names[key] || defaultPathName(base)
+      out.push({ name: name, ip: useIp, mac: mac, key: key })
+    }
+    return out
   }
 
 
@@ -204,7 +357,27 @@ module.exports = function (app) {
     const cidrs = ((options.networks && options.networks.length) ? options.networks : localCidrs()).filter(Boolean)
     const neigh = await readNeigh()
     const now = Date.now()
+    function ipInSelected (ip) {
+      if (!cidrs.length) return true
+      const parts = ip.split('.').map(Number)
+      if (parts.length !== 4) return false
+      for (const cidr of cidrs) {
+        const bits = cidr.split('/')
+        const net = bits[0].split('.').map(Number)
+        const prefix = Number(bits[1] || 24)
+        const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0
+        const ipn = ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0
+        const netn = ((net[0] << 24) | (net[1] << 16) | (net[2] << 8) | net[3]) >>> 0
+        if ((ipn & mask) === (netn & mask)) return true
+      }
+      return false
+    }
+    // drop stale entries not seen this pass (same network filter)
+    for (const ip of Array.from(discovered.keys())) {
+      if (!neigh.has(ip)) continue
+    }
     for (const entry of neigh.values()) {
+      if (!ipInSelected(entry.ip)) continue
       const hostname = await tryResolveHostname(entry.ip)
       const prev = discovered.get(entry.ip) || {}
       discovered.set(entry.ip, {
@@ -221,7 +394,7 @@ module.exports = function (app) {
         await pingOnce(parts[0] + '.' + parts[1] + '.' + parts[2] + '.254')
       }
     }
-    const tracked = (options.devices || []).filter(function (d) { return d && d.enabled !== false }).length
+    const tracked = resolveTrackedDevices(options).length
     app.setPluginStatus('Discovery: ' + discovered.size + ' in ARP/neigh; tracking ' + tracked)
   }
 
@@ -252,9 +425,7 @@ module.exports = function (app) {
   }
 
   async function checkTracked (options) {
-    const devices = (options.devices || []).filter(function (d) {
-      return d && d.enabled !== false && d.name && d.ip
-    })
+    const devices = resolveTrackedDevices(options)
     const neigh = await readNeigh()
     const missNeed = Math.max(1, Number(options.missBeforeAbsent) || 4)
 
@@ -303,6 +474,7 @@ module.exports = function (app) {
   plugin.start = function (options) {
     plugin.stop()
     options = options || {}
+    lastOptions = options
     const pingMs = Math.max(5, Number(options.pingIntervalSeconds) || 30) * 1000
     const discMs = Math.max(15, Number(options.discoverIntervalSeconds) || 60) * 1000
     app.setPluginStatus('Starting LAN presence…')
@@ -322,7 +494,7 @@ module.exports = function (app) {
     timer = setInterval(tick, pingMs)
     discoverTimer = setInterval(disc, discMs)
     statusTimer = setInterval(function () {
-      const tracked = (options.devices || []).filter(function (d) { return d && d.enabled !== false })
+      const tracked = resolveTrackedDevices(options)
       const present = tracked.filter(function (d) {
         const st = state.get(slugify(d.name))
         return st && st.present
