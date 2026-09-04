@@ -144,9 +144,29 @@ module.exports = function (app) {
   }
 
   function defaultPathName (entry) {
-    const host = (entry.hostname || '').replace(/\.local$/i, '')
+    const host = (entry.hostname || entry.mdnsName || '').replace(/\.local$/i, '')
     if (host) return slugify(host)
-    return slugify(String(entry.ip).replace(/\./g, '-'))
+    return ''
+  }
+
+  function isUglyFactoryName (name) {
+    const n = String(name || '')
+    // Shelly factory ids, bare IPs, empty, generic fallback
+    if (!n || n === 'device') return true
+    if (/^\d+-\d+-\d+-\d+$/.test(n)) return true
+    if (/^shelly/i.test(n) && /[0-9a-f]{8,}/i.test(n)) return true
+    return false
+  }
+
+  function preferName (a, b) {
+    // return the nicer of two path names
+    if (!a) return b
+    if (!b) return a
+    const ua = isUglyFactoryName(a)
+    const ub = isUglyFactoryName(b)
+    if (ua && !ub) return b
+    if (ub && !ua) return a
+    return a.length <= b.length ? a : b
   }
 
   /** Saved selection keys may outlive ARP; keep them selectable. */
@@ -355,58 +375,82 @@ module.exports = function (app) {
   function resolveTrackedDevices (options) {
     const names = options.deviceNames || {}
     const selected = normalizeSelectedKeys(options.devices)
+    const rows = []
     if (Array.isArray(options.devices) && options.devices.length && typeof options.devices[0] === 'object') {
-      return options.devices
-        .filter(function (d) { return d && d.enabled !== false && d.ip })
-        .map(function (d) {
-          return {
-            name: d.name || defaultPathName(d),
-            ip: d.ip,
-            mac: d.mac || '',
-            mdnsName: ''
-          }
+      for (const d of options.devices) {
+        if (!d || d.enabled === false || !d.ip) continue
+        rows.push({
+          name: d.name || defaultPathName(d),
+          ip: d.ip,
+          mac: d.mac || '',
+          mdnsName: '',
+          key: d.mac ? 'mac:' + String(d.mac).toLowerCase() : 'ip:' + d.ip
         })
-    }
-    const out = []
-    const seen = new Set()
-    function pushDev (key, entry, parsed) {
-      const mdnsName = (parsed && parsed.name) || normalizeMdnsName((entry && entry.hostname) || '')
-      const mac = (entry && entry.mac) || (parsed && parsed.mac) || ''
-      let useIp = (entry && entry.ip) || (parsed && parsed.ip) || ''
-      if (!useIp && mac) {
-        for (const d of discovered.values()) {
-          if (String(d.mac).toLowerCase() === mac) { useIp = d.ip; break }
+      }
+    } else {
+      function pushDev (key, entry, parsed) {
+        const mdnsName = (parsed && parsed.name) || normalizeMdnsName((entry && entry.hostname) || '')
+        const mac = (entry && entry.mac) || (parsed && parsed.mac) || ''
+        let useIp = (entry && entry.ip) || (parsed && parsed.ip) || ''
+        if (!useIp && mac) {
+          for (const d of discovered.values()) {
+            if (String(d.mac).toLowerCase() === mac) { useIp = d.ip; break }
+          }
         }
+        if (!useIp && mdnsName) {
+          const c = mdnsByName.get(mdnsName)
+          if (c) useIp = c.ip
+        }
+        const base = entry || { ip: useIp, mac: mac, hostname: mdnsName }
+        let name = names[key] || (mdnsName ? slugify(mdnsName) : defaultPathName(base))
+        if (!name || name === 'device') return
+        rows.push({ name: name, ip: useIp || '', mac: mac, key: key, mdnsName: mdnsName })
       }
-      if (!useIp && mdnsName) {
-        const c = mdnsByName.get(mdnsName)
-        if (c) useIp = c.ip
+      for (const key of selected) {
+        let entry = null
+        for (const d of discovered.values()) {
+          if (deviceKey(d) === key) { entry = d; break }
+        }
+        pushDev(key, entry, parseDeviceKey(key))
       }
-      const base = entry || { ip: useIp, mac: mac, hostname: mdnsName }
-      const name = names[key] || (mdnsName ? slugify(mdnsName) : defaultPathName(base))
-      const dedupe = mdnsName ? 'name:' + mdnsName : key
-      if (seen.has(dedupe)) return
-      seen.add(dedupe)
-      out.push({ name: name, ip: useIp || '', mac: mac, key: key, mdnsName: mdnsName })
-    }
-    for (const key of selected) {
-      let entry = null
-      for (const d of discovered.values()) {
-        if (deviceKey(d) === key) { entry = d; break }
+      for (const raw of options.mdnsNames || []) {
+        const n = normalizeMdnsName(raw)
+        if (!n) continue
+        const key = 'name:' + n
+        const c = mdnsByName.get(n)
+        const entry = c
+          ? { ip: c.ip, mac: '', hostname: n }
+          : { ip: '', mac: '', hostname: n }
+        pushDev(key, entry, { name: n, ip: '', mac: '' })
       }
-      pushDev(key, entry, parseDeviceKey(key))
     }
-    for (const raw of options.mdnsNames || []) {
-      const n = normalizeMdnsName(raw)
-      if (!n) continue
-      const key = 'name:' + n
-      const c = mdnsByName.get(n)
-      const entry = c
-        ? { ip: c.ip, mac: '', hostname: n }
-        : { ip: '', mac: '', hostname: n }
-      pushDev(key, entry, { name: n, ip: '', mac: '' })
+    // Dedupe by IP (and by mdnsName): keep friendliest path name
+    const byIp = new Map()
+    const noIp = []
+    for (const row of rows) {
+      if (!row.ip) { noIp.push(row); continue }
+      const prev = byIp.get(row.ip)
+      if (!prev) { byIp.set(row.ip, row); continue }
+      const chosen = preferName(prev.name, row.name)
+      const keep = chosen === row.name ? row : prev
+      const other = keep === row ? prev : row
+      keep.name = preferName(keep.name, other.name)
+      if (!keep.mdnsName && other.mdnsName) keep.mdnsName = other.mdnsName
+      if (!keep.mac && other.mac) keep.mac = other.mac
+      byIp.set(row.ip, keep)
     }
-    return out
+    // also dedupe no-ip rows by mdnsName
+    const byName = new Map()
+    for (const row of noIp) {
+      const k = row.mdnsName || row.name
+      const prev = byName.get(k)
+      if (!prev) byName.set(k, row)
+      else {
+        row.name = preferName(prev.name, row.name)
+        byName.set(k, row)
+      }
+    }
+    return Array.from(byIp.values()).concat(Array.from(byName.values()))
   }
 
 
@@ -595,6 +639,8 @@ module.exports = function (app) {
 
     for (const d of devices) {
       const id = slugify(d.name)
+      // never publish empty/fallback/IP-slug paths
+      if (!id || id === 'device' || /^\d+-\d+-\d+-\d+$/.test(id)) continue
       let st = state.get(id)
       if (!st) {
         st = { present: false, lastSeen: null, ip: d.ip, missStreak: 0 }
