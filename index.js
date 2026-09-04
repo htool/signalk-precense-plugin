@@ -19,6 +19,10 @@ module.exports = function (app) {
   let statusTimer = null
   const state = new Map()
   const discovered = new Map()
+  /** @type {Map<string, { host: string, ip: string, lastSeen: number }>} */
+  const mdnsByName = new Map()
+  let mdnsBrowsers = []
+
 
   plugin.schema = () => {
     const nets = listLocalNetworks()
@@ -82,6 +86,14 @@ module.exports = function (app) {
         description: 'Overschrijf de Signal K path-slug per device-key (anders hostname of IP).',
         additionalProperties: { type: 'string' },
         default: {}
+      },
+      mdnsNames: {
+        type: 'array',
+        title: 'Track by mDNS name (iPhone-friendly)',
+        description:
+          'Announced names like Hans-iPhone or Hans-iPhone.local. Resolves via mDNS each check — no fixed MAC needed (Private Wi-Fi Address OK).',
+        items: { type: 'string' },
+        default: []
       }
     }
   }
@@ -110,16 +122,25 @@ module.exports = function (app) {
   }
 
 
+  function normalizeMdnsName (name) {
+    return String(name || '')
+      .trim()
+      .replace(/\.local$/i, '')
+      .toLowerCase()
+  }
+
   function deviceKey (entry) {
+    const host = normalizeMdnsName(entry.hostname || entry.host || '')
+    if (host) return 'name:' + host
     if (entry.mac) return 'mac:' + String(entry.mac).toLowerCase()
     return 'ip:' + entry.ip
   }
 
   function deviceLabel (entry) {
     const host = (entry.hostname || '').replace(/\.local$/i, '')
-    const mac = entry.mac ? ' (' + entry.mac + ')' : ''
-    if (host) return host + ' · ' + entry.ip + mac
-    return entry.ip + mac
+    const mac = entry.mac ? ' · mac ' + entry.mac : ''
+    if (host) return host + '.local · ' + (entry.ip || '?') + mac + ' [mDNS name]'
+    return (entry.ip || '?') + mac
   }
 
   function defaultPathName (entry) {
@@ -166,8 +187,32 @@ module.exports = function (app) {
         })
       }
     }
+    for (const [name, info] of mdnsByName.entries()) {
+      const key = 'name:' + name
+      const prev = byKey.get(key)
+      if (!prev || (info.lastSeen || 0) >= (prev.lastSeen || 0)) {
+        byKey.set(key, {
+          key: key,
+          ip: info.ip,
+          mac: '',
+          hostname: name,
+          lastSeen: info.lastSeen || 0,
+          label: deviceLabel({ hostname: name, ip: info.ip, mac: '' })
+        })
+      }
+    }
+    // Prefer name: keys: drop mac:/ip: duplicates that share hostname
+    for (const [key, row] of Array.from(byKey.entries())) {
+      if (key.indexOf('name:') === 0) continue
+      if (row.hostname) {
+        const nkey = 'name:' + normalizeMdnsName(row.hostname)
+        if (byKey.has(nkey)) byKey.delete(key)
+      }
+    }
     // merge previously selected keys from lastOptions so offline devices stay listed
-    const selected = normalizeSelectedKeys(lastOptions.devices)
+    const selected = normalizeSelectedKeys(lastOptions.devices).concat(
+      (lastOptions.mdnsNames || []).map(function (n) { return 'name:' + normalizeMdnsName(n) })
+    )
     for (const key of selected) {
       if (byKey.has(key)) continue
       const parsed = parseDeviceKey(key)
@@ -186,11 +231,112 @@ module.exports = function (app) {
 
   function parseDeviceKey (key) {
     if (!key || typeof key !== 'string') return null
-    if (key.indexOf('mac:') === 0) return { mac: key.slice(4), ip: '' }
-    if (key.indexOf('ip:') === 0) return { ip: key.slice(3), mac: '' }
-    // legacy bare IP
-    if (/^\d+\.\d+\.\d+\.\d+$/.test(key)) return { ip: key, mac: '' }
+    if (key.indexOf('name:') === 0) return { name: key.slice(5), ip: '', mac: '' }
+    if (key.indexOf('mac:') === 0) return { mac: key.slice(4), ip: '', name: '' }
+    if (key.indexOf('ip:') === 0) return { ip: key.slice(3), mac: '', name: '' }
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(key)) return { ip: key, mac: '', name: '' }
+    // bare hostname
+    if (key.indexOf('.') === -1 || /\.local$/i.test(key)) {
+      return { name: normalizeMdnsName(key), ip: '', mac: '' }
+    }
     return null
+  }
+
+  function rememberMdnsHost (host, ip) {
+    const name = normalizeMdnsName(host)
+    if (!name || !ip) return
+    mdnsByName.set(name, { host: name, ip: ip, lastSeen: Date.now() })
+    const prev = discovered.get(ip) || {}
+    discovered.set(ip, {
+      ip: ip,
+      mac: prev.mac || '',
+      hostname: name,
+      lastSeen: Date.now()
+    })
+  }
+
+  function loadMdnsJs () {
+    try { return require('mdns-js') } catch (_) {}
+    try { return require('/home/pi/.signalk/node_modules/mdns-js') } catch (_) {}
+    return null
+  }
+
+  function startMdnsBrowse () {
+    stopMdnsBrowse()
+    const mdns = loadMdnsJs()
+    if (!mdns) {
+      app.debug('mdns-js not found; using avahi CLI only')
+      return
+    }
+    const types = [
+      mdns.createBrowser(),
+      mdns.createBrowser(mdns.tcp('http')),
+      mdns.createBrowser(mdns.tcp('apple-mobdev2')),
+      mdns.createBrowser(mdns.tcp('companion-link')),
+      mdns.createBrowser(mdns.tcp('airplay')),
+      mdns.createBrowser(mdns.tcp('raop')),
+      mdns.createBrowser(mdns.tcp('device-info'))
+    ]
+    for (const browser of types) {
+      browser.on('ready', function () {
+        try { browser.discover() } catch (_) {}
+      })
+      browser.on('update', function (data) {
+        try {
+          const host = data.host || ''
+          const addrs = data.addresses || []
+          const ip = addrs.find(function (a) { return /^\d+\.\d+\.\d+\.\d+$/.test(a) })
+          if (host && ip) rememberMdnsHost(host, ip)
+          else if (data.fullname && ip) {
+            const short = String(data.fullname).split('.')[0]
+            if (short) rememberMdnsHost(short, ip)
+          }
+        } catch (e) { app.debug(e) }
+      })
+      mdnsBrowsers.push(browser)
+    }
+  }
+
+  function stopMdnsBrowse () {
+    for (const b of mdnsBrowsers) {
+      try { if (b && b.stop) b.stop() } catch (_) {}
+    }
+    mdnsBrowsers = []
+  }
+
+  async function refreshMdnsViaAvahi () {
+    // Lightweight: resolve known mdnsNames + parse a short browse for host/address pairs
+    const out = await run('timeout', ['6', 'avahi-browse', '-atrk'], 8000)
+    let curHost = ''
+    for (const line of String(out).split('\n')) {
+      let m = line.match(/hostname = \[([^\]]+)\]/)
+      if (m) { curHost = m[1]; continue }
+      m = line.match(/address = \[(\d+\.\d+\.\d+\.\d+)\]/)
+      if (m && curHost) {
+        rememberMdnsHost(curHost, m[1])
+        curHost = ''
+      }
+    }
+  }
+
+  async function resolveMdnsNameToIp (name) {
+    const n = normalizeMdnsName(name)
+    const cached = mdnsByName.get(n)
+    if (cached && cached.ip && Date.now() - cached.lastSeen < 120000) return cached.ip
+    const fqdn = n + '.local'
+    let text = await run('avahi-resolve-host-name', ['-4', fqdn], 4000)
+    let m = String(text).match(/(\d+\.\d+\.\d+\.\d+)/)
+    if (m) {
+      rememberMdnsHost(n, m[1])
+      return m[1]
+    }
+    text = await run('getent', ['hosts', fqdn], 3000)
+    m = String(text).match(/(\d+\.\d+\.\d+\.\d+)/)
+    if (m) {
+      rememberMdnsHost(n, m[1])
+      return m[1]
+    }
+    return (cached && cached.ip) || ''
   }
 
   function normalizeSelectedKeys (devices) {
@@ -209,7 +355,6 @@ module.exports = function (app) {
   function resolveTrackedDevices (options) {
     const names = options.deviceNames || {}
     const selected = normalizeSelectedKeys(options.devices)
-    // legacy object rows with name
     if (Array.isArray(options.devices) && options.devices.length && typeof options.devices[0] === 'object') {
       return options.devices
         .filter(function (d) { return d && d.enabled !== false && d.ip })
@@ -217,31 +362,49 @@ module.exports = function (app) {
           return {
             name: d.name || defaultPathName(d),
             ip: d.ip,
-            mac: d.mac || ''
+            mac: d.mac || '',
+            mdnsName: ''
           }
         })
     }
     const out = []
-    for (const key of selected) {
-      let entry = null
-      for (const d of discovered.values()) {
-        if (deviceKey(d) === key) { entry = d; break }
-      }
-      const parsed = parseDeviceKey(key)
-      const ip = (entry && entry.ip) || (parsed && parsed.ip) || ''
+    const seen = new Set()
+    function pushDev (key, entry, parsed) {
+      const mdnsName = (parsed && parsed.name) || normalizeMdnsName((entry && entry.hostname) || '')
       const mac = (entry && entry.mac) || (parsed && parsed.mac) || ''
-      if (!ip && !mac) continue
-      // if only mac known, try find current ip from discovered
-      let useIp = ip
+      let useIp = (entry && entry.ip) || (parsed && parsed.ip) || ''
       if (!useIp && mac) {
         for (const d of discovered.values()) {
           if (String(d.mac).toLowerCase() === mac) { useIp = d.ip; break }
         }
       }
-      if (!useIp) continue
-      const base = entry || { ip: useIp, mac: mac, hostname: '' }
-      const name = names[key] || defaultPathName(base)
-      out.push({ name: name, ip: useIp, mac: mac, key: key })
+      if (!useIp && mdnsName) {
+        const c = mdnsByName.get(mdnsName)
+        if (c) useIp = c.ip
+      }
+      const base = entry || { ip: useIp, mac: mac, hostname: mdnsName }
+      const name = names[key] || (mdnsName ? slugify(mdnsName) : defaultPathName(base))
+      const dedupe = mdnsName ? 'name:' + mdnsName : key
+      if (seen.has(dedupe)) return
+      seen.add(dedupe)
+      out.push({ name: name, ip: useIp || '', mac: mac, key: key, mdnsName: mdnsName })
+    }
+    for (const key of selected) {
+      let entry = null
+      for (const d of discovered.values()) {
+        if (deviceKey(d) === key) { entry = d; break }
+      }
+      pushDev(key, entry, parseDeviceKey(key))
+    }
+    for (const raw of options.mdnsNames || []) {
+      const n = normalizeMdnsName(raw)
+      if (!n) continue
+      const key = 'name:' + n
+      const c = mdnsByName.get(n)
+      const entry = c
+        ? { ip: c.ip, mac: '', hostname: n }
+        : { ip: '', mac: '', hostname: n }
+      pushDev(key, entry, { name: n, ip: '', mac: '' })
     }
     return out
   }
@@ -394,8 +557,9 @@ module.exports = function (app) {
         await pingOnce(parts[0] + '.' + parts[1] + '.' + parts[2] + '.254')
       }
     }
+    try { await refreshMdnsViaAvahi() } catch (e) { app.debug(e) }
     const tracked = resolveTrackedDevices(options).length
-    app.setPluginStatus('Discovery: ' + discovered.size + ' in ARP/neigh; tracking ' + tracked)
+    app.setPluginStatus('Discovery: ' + discovered.size + ' hosts, mDNS ' + mdnsByName.size + '; tracking ' + tracked)
   }
 
   function devicePresentFromNeigh (device, neigh) {
@@ -437,9 +601,28 @@ module.exports = function (app) {
         state.set(id, st)
       }
 
+      let resolvedNow = ''
+      if (d.mdnsName) {
+        resolvedNow = await resolveMdnsNameToIp(d.mdnsName)
+        if (resolvedNow) d.ip = resolvedNow
+      }
+      if (!d.ip) {
+        st.missStreak += 1
+        if (st.present && st.missStreak >= missNeed) {
+          st.present = false
+          publishDevice(id, false, st.ip, st.lastSeen)
+        } else if (st.present) {
+          publishDevice(id, true, st.ip, st.lastSeen)
+        } else {
+          publishDevice(id, false, st.ip, st.lastSeen)
+        }
+        continue
+      }
+
       const pingOk = await pingOnce(d.ip)
       const arpOk = devicePresentFromNeigh(d, neigh)
-      const alive = pingOk || arpOk
+      // mDNS resolve success = announced on LAN (good for sleeping iPhones that ignore ICMP)
+      const alive = pingOk || arpOk || !!resolvedNow
 
       if (alive) {
         st.missStreak = 0
@@ -478,6 +661,7 @@ module.exports = function (app) {
     const pingMs = Math.max(5, Number(options.pingIntervalSeconds) || 30) * 1000
     const discMs = Math.max(15, Number(options.discoverIntervalSeconds) || 60) * 1000
     app.setPluginStatus('Starting LAN presence…')
+    startMdnsBrowse()
 
     const tick = async function () {
       try { await checkTracked(options) } catch (e) {
@@ -508,6 +692,7 @@ module.exports = function (app) {
     if (discoverTimer) clearInterval(discoverTimer)
     if (statusTimer) clearInterval(statusTimer)
     timer = discoverTimer = statusTimer = null
+    stopMdnsBrowse()
   }
 
   plugin._discovered = discovered
