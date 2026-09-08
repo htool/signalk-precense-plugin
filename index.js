@@ -172,6 +172,74 @@ module.exports = function (app) {
   /** Saved selection keys may outlive ARP; keep them selectable. */
   let lastOptions = {}
 
+  function watchedCidrs (options) {
+    options = options || lastOptions || {}
+    const listed = (options.networks && options.networks.length) ? options.networks : localCidrs()
+    return listed.filter(Boolean)
+  }
+
+  function ipMatchesCidrs (ip, cidrs) {
+    const parts = String(ip || '').split('.').map(Number)
+    if (parts.length !== 4 || parts.some(function (p) { return !Number.isFinite(p) })) return false
+    if (!cidrs || !cidrs.length) return true
+    const ipn = ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0
+    for (const cidr of cidrs) {
+      const bits = String(cidr).split('/')
+      const net = bits[0].split('.').map(Number)
+      if (net.length !== 4) continue
+      const prefix = Number(bits[1] || 24)
+      const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0
+      const netn = ((net[0] << 24) | (net[1] << 16) | (net[2] << 8) | net[3]) >>> 0
+      if ((ipn & mask) === (netn & mask)) return true
+    }
+    return false
+  }
+
+  function ipInWatched (ip, options) {
+    return ipMatchesCidrs(ip, watchedCidrs(options))
+  }
+
+  function pickWatchedIp (ips, options) {
+    const list = (ips || []).filter(function (a) { return /^\d+\.\d+\.\d+\.\d+$/.test(a) })
+    const cidrs = watchedCidrs(options)
+    for (let i = 0; i < list.length; i++) {
+      if (ipMatchesCidrs(list[i], cidrs)) return list[i]
+    }
+    return ''
+  }
+
+  function bestDiscoveredForKey (key) {
+    let best = null
+    for (const d of discovered.values()) {
+      if (deviceKey(d) !== key) continue
+      if (!ipInWatched(d.ip)) continue
+      if (!best || (d.lastSeen || 0) >= (best.lastSeen || 0)) best = d
+    }
+    return best
+  }
+
+  function ipForMac (mac) {
+    if (!mac) return ''
+    const want = String(mac).toLowerCase()
+    for (const d of discovered.values()) {
+      if (String(d.mac || '').toLowerCase() === want && ipInWatched(d.ip)) return d.ip
+    }
+    return ''
+  }
+
+  function neighIpForMac (mac, neigh) {
+    if (!mac || !neigh) return ''
+    const want = String(mac).toLowerCase()
+    let fallback = ''
+    for (const n of neigh.values()) {
+      if (n.mac !== want) continue
+      if (!ipInWatched(n.ip)) continue
+      if (n.state === 'REACHABLE' || n.state === 'DELAY' || n.state === 'PROBE') return n.ip
+      if (!fallback) fallback = n.ip
+    }
+    return fallback
+  }
+
   function seedDiscoveredFromArpSync () {
     if (discovered.size) return
     try {
@@ -182,6 +250,7 @@ module.exports = function (app) {
         const ip = p[0]
         const mac = (p[3] || '').toLowerCase()
         if (!mac || mac === '00:00:00:00:00:00') continue
+        if (!ipInWatched(ip)) continue
         if (!discovered.has(ip)) {
           discovered.set(ip, { ip: ip, mac: mac, hostname: '', lastSeen: Date.now() })
         }
@@ -193,7 +262,7 @@ module.exports = function (app) {
     seedDiscoveredFromArpSync()
     const byKey = new Map()
     for (const entry of discovered.values()) {
-      if (!entry || !entry.ip) continue
+      if (!entry || !entry.ip || !ipInWatched(entry.ip)) continue
       const key = deviceKey(entry)
       const prev = byKey.get(key)
       if (!prev || (entry.lastSeen || 0) >= (prev.lastSeen || 0)) {
@@ -208,6 +277,7 @@ module.exports = function (app) {
       }
     }
     for (const [name, info] of mdnsByName.entries()) {
+      if (!ipInWatched(info.ip)) continue
       const key = 'name:' + name
       const prev = byKey.get(key)
       if (!prev || (info.lastSeen || 0) >= (prev.lastSeen || 0)) {
@@ -264,7 +334,7 @@ module.exports = function (app) {
 
   function rememberMdnsHost (host, ip) {
     const name = normalizeMdnsName(host)
-    if (!name || !ip) return
+    if (!name || !ip || !ipInWatched(ip)) return
     mdnsByName.set(name, { host: name, ip: ip, lastSeen: Date.now() })
     const prev = discovered.get(ip) || {}
     discovered.set(ip, {
@@ -305,7 +375,7 @@ module.exports = function (app) {
         try {
           const host = data.host || ''
           const addrs = data.addresses || []
-          const ip = addrs.find(function (a) { return /^\d+\.\d+\.\d+\.\d+$/.test(a) })
+          const ip = pickWatchedIp(addrs)
           if (host && ip) rememberMdnsHost(host, ip)
           else if (data.fullname && ip) {
             const short = String(data.fullname).split('.')[0]
@@ -342,21 +412,21 @@ module.exports = function (app) {
   async function resolveMdnsNameToIp (name) {
     const n = normalizeMdnsName(name)
     const cached = mdnsByName.get(n)
-    if (cached && cached.ip && Date.now() - cached.lastSeen < 120000) return cached.ip
+    if (cached && cached.ip && ipInWatched(cached.ip) && Date.now() - cached.lastSeen < 120000) return cached.ip
     const fqdn = n + '.local'
     let text = await run('avahi-resolve-host-name', ['-4', fqdn], 4000)
     let m = String(text).match(/(\d+\.\d+\.\d+\.\d+)/)
-    if (m) {
+    if (m && ipInWatched(m[1])) {
       rememberMdnsHost(n, m[1])
       return m[1]
     }
     text = await run('getent', ['hosts', fqdn], 3000)
     m = String(text).match(/(\d+\.\d+\.\d+\.\d+)/)
-    if (m) {
+    if (m && ipInWatched(m[1])) {
       rememberMdnsHost(n, m[1])
       return m[1]
     }
-    return (cached && cached.ip) || ''
+    return (cached && cached.ip && ipInWatched(cached.ip)) ? cached.ip : ''
   }
 
   function normalizeSelectedKeys (devices) {
@@ -392,14 +462,11 @@ module.exports = function (app) {
         const mdnsName = (parsed && parsed.name) || normalizeMdnsName((entry && entry.hostname) || '')
         const mac = (entry && entry.mac) || (parsed && parsed.mac) || ''
         let useIp = (entry && entry.ip) || (parsed && parsed.ip) || ''
-        if (!useIp && mac) {
-          for (const d of discovered.values()) {
-            if (String(d.mac).toLowerCase() === mac) { useIp = d.ip; break }
-          }
-        }
+        if (useIp && !ipInWatched(useIp, options)) useIp = ''
+        if (!useIp && mac) useIp = ipForMac(mac)
         if (!useIp && mdnsName) {
           const c = mdnsByName.get(mdnsName)
-          if (c) useIp = c.ip
+          if (c && ipInWatched(c.ip, options)) useIp = c.ip
         }
         const base = entry || { ip: useIp, mac: mac, hostname: mdnsName }
         let name = names[key] || (mdnsName ? slugify(mdnsName) : defaultPathName(base))
@@ -407,18 +474,14 @@ module.exports = function (app) {
         rows.push({ name: name, ip: useIp || '', mac: mac, key: key, mdnsName: mdnsName })
       }
       for (const key of selected) {
-        let entry = null
-        for (const d of discovered.values()) {
-          if (deviceKey(d) === key) { entry = d; break }
-        }
-        pushDev(key, entry, parseDeviceKey(key))
+        pushDev(key, bestDiscoveredForKey(key), parseDeviceKey(key))
       }
       for (const raw of options.mdnsNames || []) {
         const n = normalizeMdnsName(raw)
         if (!n) continue
         const key = 'name:' + n
         const c = mdnsByName.get(n)
-        const entry = c
+        const entry = (c && ipInWatched(c.ip, options))
           ? { ip: c.ip, mac: '', hostname: n }
           : { ip: '', mac: '', hostname: n }
         pushDev(key, entry, { name: n, ip: '', mac: '' })
@@ -561,30 +624,17 @@ module.exports = function (app) {
   }
 
   async function refreshDiscovery (options) {
-    const cidrs = ((options.networks && options.networks.length) ? options.networks : localCidrs()).filter(Boolean)
+    const cidrs = watchedCidrs(options)
     const neigh = await readNeigh()
     const now = Date.now()
-    function ipInSelected (ip) {
-      if (!cidrs.length) return true
-      const parts = ip.split('.').map(Number)
-      if (parts.length !== 4) return false
-      for (const cidr of cidrs) {
-        const bits = cidr.split('/')
-        const net = bits[0].split('.').map(Number)
-        const prefix = Number(bits[1] || 24)
-        const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0
-        const ipn = ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0
-        const netn = ((net[0] << 24) | (net[1] << 16) | (net[2] << 8) | net[3]) >>> 0
-        if ((ipn & mask) === (netn & mask)) return true
-      }
-      return false
-    }
-    // drop stale entries not seen this pass (same network filter)
     for (const ip of Array.from(discovered.keys())) {
-      if (!neigh.has(ip)) continue
+      if (!ipInWatched(ip, options)) discovered.delete(ip)
+    }
+    for (const [name, info] of Array.from(mdnsByName.entries())) {
+      if (!ipInWatched(info.ip, options)) mdnsByName.delete(name)
     }
     for (const entry of neigh.values()) {
-      if (!ipInSelected(entry.ip)) continue
+      if (!ipInWatched(entry.ip, options)) continue
       const hostname = await tryResolveHostname(entry.ip)
       const prev = discovered.get(entry.ip) || {}
       discovered.set(entry.ip, {
@@ -607,13 +657,8 @@ module.exports = function (app) {
   }
 
   function devicePresentFromNeigh (device, neigh) {
-    if (device.ip && neigh.has(device.ip)) return true
-    if (device.mac) {
-      const want = String(device.mac).toLowerCase()
-      for (const n of neigh.values()) {
-        if (n.mac === want) return true
-      }
-    }
+    if (device.ip && ipInWatched(device.ip) && neigh.has(device.ip)) return true
+    if (device.mac && neighIpForMac(device.mac, neigh)) return true
     return false
   }
 
@@ -646,12 +691,16 @@ module.exports = function (app) {
         st = { present: false, lastSeen: null, ip: d.ip, missStreak: 0 }
         state.set(id, st)
       }
+      if (st.ip && !ipInWatched(st.ip, options)) st.ip = d.ip || null
 
       let resolvedNow = ''
       if (d.mdnsName) {
         resolvedNow = await resolveMdnsNameToIp(d.mdnsName)
+        if (resolvedNow && !ipInWatched(resolvedNow, options)) resolvedNow = ''
         if (resolvedNow) d.ip = resolvedNow
       }
+      if (d.ip && !ipInWatched(d.ip, options)) d.ip = ''
+      if (!d.ip && d.mac) d.ip = neighIpForMac(d.mac, neigh) || ipForMac(d.mac)
       if (!d.ip) {
         st.missStreak += 1
         if (st.present && st.missStreak >= missNeed) {
@@ -673,13 +722,9 @@ module.exports = function (app) {
       if (alive) {
         st.missStreak = 0
         st.lastSeen = Date.now()
-        st.ip = d.ip
-        if (d.mac) {
-          const want = String(d.mac).toLowerCase()
-          for (const n of neigh.values()) {
-            if (n.mac === want) { st.ip = n.ip; break }
-          }
-        }
+        st.ip = ipInWatched(d.ip, options) ? d.ip : ''
+        const fromNeigh = neighIpForMac(d.mac, neigh)
+        if (fromNeigh) st.ip = fromNeigh
         if (!st.present) {
           st.present = true
           app.debug(id + ' present (' + (pingOk ? 'ping' : 'arp') + ')')
