@@ -1,0 +1,11 @@
+{
+  "name": "signalk-precense-plugin",
+  "version": "0.1.0",
+  "description": "Signal K plugin: LAN device presence via ping + ARP/neigh",
+  "main": "index.js",
+  "keywords": ["signalk-node-server-plugin", "signalk-category-sensors", "presence"],
+  "author": "Hans Tool",
+  "license": "MIT",
+  "repository": {"type": "git", "url": "https://github.com/htool/signalk-precense-plugin.git"},
+  "signalk-plugin-enabled-by-default": false
+}
