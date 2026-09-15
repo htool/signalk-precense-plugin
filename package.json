@@ -1,6 +1,6 @@
 {
   "name": "signalk-precense-plugin",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Signal K plugin: LAN device presence via ping + ARP/neigh",
   "main": "index.js",
   "keywords": ["signalk-node-server-plugin", "signalk-category-sensors", "presence"],
