@@ -7,6 +7,30 @@ const execFileAsync = promisify(execFile)
 const PLUGIN_ID = 'signalk-precense-plugin'
 const PATH_PREFIX = 'sensors.presence'
 
+/** Boolean / ip only when they change. lastSeen every poll once a time exists. */
+function presenceUpdateValues (id, present, lastSeenMs, ip, sent) {
+  sent = sent || {}
+  const base = PATH_PREFIX + '.' + id
+  const presentBool = !!present
+  const ipVal = ip || null
+  const lastSeenVal = lastSeenMs ? new Date(lastSeenMs).toISOString() : null
+  const values = []
+  if (sent.present !== presentBool) {
+    values.push({
+      path: base,
+      value: presentBool,
+      meta: { description: 'LAN presence for ' + id, displayName: id }
+    })
+  }
+  if (lastSeenMs != null || sent.lastSeen === undefined) {
+    values.push({ path: base + '.lastSeen', value: lastSeenVal })
+  }
+  if (sent.ip !== ipVal) {
+    values.push({ path: base + '.ip', value: ipVal })
+  }
+  return values
+}
+
 module.exports = function (app) {
   const plugin = {}
   plugin.id = PLUGIN_ID
@@ -662,19 +686,22 @@ module.exports = function (app) {
     return false
   }
 
-  function publishDevice (id, present, ip, lastSeenMs) {
-    const base = PATH_PREFIX + '.' + id
+  function publishDevice (id, st) {
+    const values = presenceUpdateValues(id, st.present, st.lastSeen, st.ip, st.sent)
+    if (!values.length) return
     app.handleMessage(PLUGIN_ID, {
       updates: [{
         source: { label: PLUGIN_ID },
         timestamp: new Date().toISOString(),
-        values: [
-          { path: base, value: !!present, meta: { description: 'LAN presence for ' + id, displayName: id } },
-          { path: base + '.lastSeen', value: lastSeenMs ? new Date(lastSeenMs).toISOString() : null },
-          { path: base + '.ip', value: ip || null }
-        ]
+        values: values
       }]
     })
+    const base = PATH_PREFIX + '.' + id
+    for (const v of values) {
+      if (v.path === base) st.sent.present = v.value
+      else if (v.path === base + '.lastSeen') st.sent.lastSeen = v.value
+      else if (v.path === base + '.ip') st.sent.ip = v.value
+    }
   }
 
   async function checkTracked (options) {
@@ -688,9 +715,10 @@ module.exports = function (app) {
       if (!id || id === 'device' || /^\d+-\d+-\d+-\d+$/.test(id)) continue
       let st = state.get(id)
       if (!st) {
-        st = { present: false, lastSeen: null, ip: d.ip, missStreak: 0 }
+        st = { present: false, lastSeen: null, ip: d.ip, missStreak: 0, sent: {} }
         state.set(id, st)
       }
+      if (!st.sent) st.sent = {}
       if (st.ip && !ipInWatched(st.ip, options)) st.ip = d.ip || null
 
       let resolvedNow = ''
@@ -705,12 +733,8 @@ module.exports = function (app) {
         st.missStreak += 1
         if (st.present && st.missStreak >= missNeed) {
           st.present = false
-          publishDevice(id, false, st.ip, st.lastSeen)
-        } else if (st.present) {
-          publishDevice(id, true, st.ip, st.lastSeen)
-        } else {
-          publishDevice(id, false, st.ip, st.lastSeen)
         }
+        publishDevice(id, st)
         continue
       }
 
@@ -729,19 +753,14 @@ module.exports = function (app) {
           st.present = true
           app.debug(id + ' present (' + (pingOk ? 'ping' : 'arp') + ')')
         }
-        publishDevice(id, true, st.ip, st.lastSeen)
       } else {
         st.missStreak += 1
         if (st.present && st.missStreak >= missNeed) {
           st.present = false
           app.debug(id + ' absent after ' + st.missStreak + ' misses')
-          publishDevice(id, false, st.ip, st.lastSeen)
-        } else if (st.present) {
-          publishDevice(id, true, st.ip, st.lastSeen)
-        } else {
-          publishDevice(id, false, st.ip, st.lastSeen)
         }
       }
+      publishDevice(id, st)
     }
   }
 
@@ -789,3 +808,6 @@ module.exports = function (app) {
   plugin._discovered = discovered
   return plugin
 }
+
+module.exports.presenceUpdateValues = presenceUpdateValues
+module.exports.PATH_PREFIX = PATH_PREFIX
